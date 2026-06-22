@@ -82,7 +82,6 @@ func (w *Watcher) Close() {
 func (w *Watcher) Destroy() {
 	if w != nil && w.handle != nil {
 		C.filecat_destroy(w.handle)
-		w.handle = nil
 	}
 }
 
