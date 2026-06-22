@@ -21,13 +21,13 @@
 flowchart TB
     User["<b>User Go application</b><br/><code>for ev := range w.Events()</code>"]
 
-    subgraph GoLayer["📦  filecat-go &nbsp;·&nbsp; Go semantic layer (cgo)"]
+    subgraph GoLayer["filecat-go &nbsp;·&nbsp; Go semantic layer (cgo)"]
         direction LR
         API["<b>Channel-based API</b><br/>chan Event<br/>Move · Create · Modify · Remove"]
         Pipeline["<b>Coalescing pipeline</b><br/>Batch drain (amortize cgo cost)<br/>Rename-pair → Move synthesis<br/>Modify dedup / debounce"]
     end
 
-    subgraph CLayer["⚙️  filecat &nbsp;·&nbsp; C core library"]
+    subgraph CLayer["filecat &nbsp;·&nbsp; C core library"]
         direction TB
         ABI["<b>Unified C ABI</b><br/><code>filecat_event_t</code> — raw OS events"]
         Linux["<b>Linux</b><br/>inotify"]
