@@ -1,18 +1,20 @@
-/* Filecat — macOS backend (FSEvents + dispatch queue + pthread condvar).
+/* Filecat — macOS backend (FSEvents v2 + extended data + dispatch queue).
  *
- * The Windows backend's lifecycle/locking model (refcount + two set-once
- * latches) maps onto macOS verbatim; only the I/O substrate differs. Here
- * FSEvents pushes batches of events into a callback running on a serial
- * dispatch queue; the callback strips the watch root, classifies each event,
- * appends nodes to a linked-list queue, and signals a pthread_cond_t that
- * filecat_next_event blocks on.
+ * The lifecycle model (refcount + two set-once latches) is the same as the
+ * Windows and Linux backends; only the I/O substrate differs. FSEvents
+ * pushes batches of events into a callback running on a serial dispatch
+ * queue; the callback strips the watch root, classifies each event, reads
+ * the inode out of kFSEventStreamEventExtendedFileIDKey, and appends nodes
+ * to a linked-list queue. filecat_next_event blocks on a pthread_cond_t.
  *
- * Rename note: FSEvents sets `kFSEventStreamEventFlagItemRenamed` on both
- * sides of a rename without pairing them. We deliberately do NOT infer
- * OLD vs NEW via lstat or any other tracking — every renamed item is
- * surfaced as FILECAT_EVENT_RENAMED_OLD and the caller is expected to
- * interpret raw events. This is intentional: the library does not synthesize
- * higher-level semantics from native flags on macOS.
+ * Requires macOS 10.13+ for kFSEventStreamCreateFlagUseExtendedData.
+ *
+ * Rename note: FSEvents sets kFSEventStreamEventFlagItemRenamed on both
+ * sides of a rename without pairing them, but the inode (extended data)
+ * is identical on both sides — downstream pairs via
+ * event.event_correlation_id. As on Linux, every renamed item is surfaced
+ * as FILECAT_EVENT_RENAMED_OLD; the library does not synthesize OLD/NEW
+ * from native flags.
  */
 
 /* Force dispatch types to be plain C handles (not Objective-C objects under
@@ -40,6 +42,7 @@
 /* ---- per-event node in the producer→consumer linked-list queue --------- */
 struct fc_node {
     filecat_event_type_t type;
+    uint64_t             inode;      /* 0 if extended data didn't provide one */
     char                *rel_path;   /* malloc'd UTF-8 relative path, owned */
     struct fc_node      *next;
 };
@@ -101,8 +104,9 @@ static filecat_event_type_t map_flags(FSEventStreamEventFlags f)
 {
     if (f & kFSEventStreamEventFlagItemRenamed) {
         /* FSEvents reports the same flag on both sides of a rename and
-         * never tells us which is which. By design we don't infer; the
-         * raw event is exposed as RENAMED_OLD. */
+         * never tells us which is which. By design we don't infer; both
+         * halves are surfaced as RENAMED_OLD and the consumer pairs them
+         * via event_correlation_id (the shared inode). */
         return FILECAT_EVENT_RENAMED_OLD;
     }
     if (f & kFSEventStreamEventFlagItemRemoved) return FILECAT_EVENT_REMOVED;
@@ -165,6 +169,11 @@ static int compute_rel(const filecat_watcher_t *w,
 
 /* ---- FSEvents callback (runs on the serial dispatch queue) ------------ *
  *
+ * With kFSEventStreamCreateFlagUseExtendedData set, `eventPaths` is a
+ * CFArrayRef of CFDictionaryRef. Each dict carries:
+ *   kFSEventStreamEventExtendedDataPathKey -> CFString (the absolute path)
+ *   kFSEventStreamEventExtendedFileIDKey   -> CFNumber (the inode, uint64)
+ *
  * We build a local linked-list of nodes BEFORE touching the shared mutex,
  * then splice it in at the end — keeps the consumer's wake-up critical
  * section short, and we never call malloc while holding the mutex.
@@ -178,7 +187,7 @@ static void fsevents_cb(ConstFSEventStreamRef stream,
 {
     (void)stream; (void)eventIds;
     filecat_watcher_t *w = (filecat_watcher_t *)info;
-    char **paths = (char **)eventPaths;
+    CFArrayRef events = (CFArrayRef)eventPaths;
 
     struct fc_node *local_head = NULL, *local_tail = NULL;
     int local_overflow = 0;
@@ -186,30 +195,61 @@ static void fsevents_cb(ConstFSEventStreamRef stream,
     for (size_t i = 0; i < numEvents; i++) {
         FSEventStreamEventFlags fl = eventFlags[i];
 
-        /* Drop/scan flags → OVERFLOW. We still process the other events
-         * in the batch; the consumer will see one OVERFLOW followed by
-         * the rest, matching the Linux/Windows recovery semantics. */
+        /* Drop/scan flags → OVERFLOW. We still process the rest of the
+         * batch; the consumer will see one OVERFLOW followed by the
+         * remaining events, matching the Linux/Windows recovery semantics. */
         if (fl & ( kFSEventStreamEventFlagMustScanSubDirs
                  | kFSEventStreamEventFlagUserDropped
                  | kFSEventStreamEventFlagKernelDropped)) {
             local_overflow = 1;
         }
 
-        const char *abs = paths[i];
+        CFDictionaryRef dict =
+            (CFDictionaryRef)CFArrayGetValueAtIndex(events, (CFIndex)i);
+        if (!dict) continue;
+
+        CFStringRef cf_path = (CFStringRef)CFDictionaryGetValue(
+            dict, kFSEventStreamEventExtendedDataPathKey);
+        if (!cf_path) continue;
+
+        /* CFStringGetFileSystemRepresentation produces the canonical
+         * UTF-8 form macOS uses on disk (NFD). Size bound includes the
+         * trailing NUL. */
+        CFIndex max_len = CFStringGetMaximumSizeOfFileSystemRepresentation(cf_path);
+        char *abs = (char *)malloc((size_t)max_len);
         if (!abs) continue;
+        if (!CFStringGetFileSystemRepresentation(cf_path, abs, max_len)) {
+            free(abs);
+            continue;
+        }
         size_t abs_len = strlen(abs);
 
         const char *rel; size_t rel_len;
-        if (!compute_rel(w, abs, abs_len, &rel, &rel_len)) continue;
+        if (!compute_rel(w, abs, abs_len, &rel, &rel_len)) {
+            free(abs);
+            continue;
+        }
 
         char *rp = (char *)malloc(rel_len + 1);
-        if (!rp) continue;   /* on OOM, drop just this event */
+        if (!rp) { free(abs); continue; }
         memcpy(rp, rel, rel_len);
         rp[rel_len] = '\0';
+        free(abs);
+
+        /* Inode from extended data. CFNumber doesn't have an unsigned
+         * 64-bit type; SInt64 with reinterpreted bits is the convention,
+         * and real inodes fit comfortably below 2^63. */
+        uint64_t inode = 0;
+        CFNumberRef cf_inode = (CFNumberRef)CFDictionaryGetValue(
+            dict, kFSEventStreamEventExtendedFileIDKey);
+        if (cf_inode) {
+            CFNumberGetValue(cf_inode, kCFNumberSInt64Type, &inode);
+        }
 
         struct fc_node *node = (struct fc_node *)malloc(sizeof(*node));
         if (!node) { free(rp); continue; }
         node->type     = map_flags(fl);
+        node->inode    = inode;
         node->rel_path = rp;
         node->next     = NULL;
 
@@ -376,12 +416,22 @@ filecat_status_t filecat_open(const char *path, int recursive,
         return FILECAT_ERR_NO_MEMORY;
     }
 
-    /* NoDefer: deliver the first batch with no latency window.
-     * FileEvents (10.7+): per-file granularity so we can map flags to
-     *                     CREATED / REMOVED / MODIFIED / RENAMED. */
+    /* NoDefer:        deliver the first batch with no latency window.
+     * FileEvents:     per-file granularity so we can map flags to
+     *                 CREATED / REMOVED / MODIFIED / RENAMED (10.7+).
+     * UseCFTypes:     callback's eventPaths is a CFArrayRef (not char**).
+     *                 Required by UseExtendedData — Apple's docs say
+     *                 "implies" in places and "must be paired with" in
+     *                 others; on the CI image FSEventStreamCreate
+     *                 returns NULL without it, so we set both explicitly.
+     * UseExtendedData: callback receives CFArray<CFDictionary> with the
+     *                 path AND the inode per event (10.13+) — the inode
+     *                 becomes event.event_correlation_id. */
     FSEventStreamContext ctx = {0, w, NULL, NULL, NULL};
     FSEventStreamCreateFlags flags = kFSEventStreamCreateFlagNoDefer
-                                   | kFSEventStreamCreateFlagFileEvents;
+                                   | kFSEventStreamCreateFlagFileEvents
+                                   | kFSEventStreamCreateFlagUseCFTypes
+                                   | kFSEventStreamCreateFlagUseExtendedData;
     w->stream = FSEventStreamCreate(NULL, fsevents_cb, &ctx, paths_array,
                                     kFSEventStreamEventIdSinceNow,
                                     0.0, flags);
@@ -462,8 +512,9 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
     }
     memcpy(w->utf8_path, n->rel_path, need);
 
-    out->type = n->type;
-    out->path = w->utf8_path;
+    out->type                 = n->type;
+    out->path                 = w->utf8_path;
+    out->event_correlation_id = n->inode;
 
     free(n->rel_path);
     free(n);

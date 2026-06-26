@@ -1,7 +1,19 @@
 #include "filecat/filecat.h"
 
+/* Pin the SDK feature gate so ReadDirectoryChangesExW and
+ * FILE_NOTIFY_EXTENDED_INFORMATION are visible. Both were introduced in
+ * Windows 10 1709 (build 16299, NTDDI_WIN10_RS3). We target Win10/11
+ * exclusively -- no fallback to the legacy ReadDirectoryChangesW. */
+#ifndef _WIN32_WINNT
+#  define _WIN32_WINNT 0x0A00          /* Windows 10 */
+#endif
+#ifndef NTDDI_VERSION
+#  define NTDDI_VERSION 0x0A000004     /* NTDDI_WIN10_RS3 (1709) */
+#endif
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,9 +30,9 @@
 struct filecat_watcher {
     HANDLE  hDir;
     BOOL    bWatchSubtree;
-    BYTE   *buffer;                  /* FILECAT_BUFFER_SIZE bytes, DWORD-aligned */
-    FILE_NOTIFY_INFORMATION *current; /* next record to emit, or NULL if buffer drained */
-    char   *utf8_path;                /* scratch UTF-8 buffer returned via event.path */
+    BYTE   *buffer;                            /* FILECAT_BUFFER_SIZE bytes, DWORD-aligned */
+    FILE_NOTIFY_EXTENDED_INFORMATION *current; /* next record to emit, or NULL if buffer drained */
+    char   *utf8_path;                         /* scratch UTF-8 buffer returned via event.path */
     int     utf8_capacity;
 
     /* Lifecycle bookkeeping. All accessed via Interlocked*; reads use the
@@ -287,12 +299,17 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
             return FILECAT_ERR_CLOSED;
         }
         DWORD bytes = 0;
-        BOOL ok = ReadDirectoryChangesW(
+        /* ReadDirectoryChangesExW with ReadDirectoryNotifyExtendedInformation
+         * fills the buffer with FILE_NOTIFY_EXTENDED_INFORMATION records,
+         * which carry the NTFS FileId (and ParentFileId, timestamps, size,
+         * attrs) alongside the action and name. Win10 1709+ / Win11. */
+        BOOL ok = ReadDirectoryChangesExW(
             h, w->buffer, FILECAT_BUFFER_SIZE,
             w->bWatchSubtree, FILECAT_NOTIFY_FILTER,
             &bytes,
             NULL,    /* synchronous: no OVERLAPPED */
-            NULL);   /* no completion routine */
+            NULL,    /* no completion routine */
+            ReadDirectoryNotifyExtendedInformation);
         if (!ok) {
             DWORD err = GetLastError();
             watcher_release(w);
@@ -304,10 +321,10 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
             watcher_release(w);
             return FILECAT_ERR_OVERFLOW;
         }
-        w->current = (FILE_NOTIFY_INFORMATION *)w->buffer;
+        w->current = (FILE_NOTIFY_EXTENDED_INFORMATION *)w->buffer;
     }
 
-    FILE_NOTIFY_INFORMATION *fni = w->current;
+    FILE_NOTIFY_EXTENDED_INFORMATION *fni = w->current;
     out->type = map_action(fni->Action);
 
     int wlen_chars = (int)(fni->FileNameLength / sizeof(WCHAR));
@@ -317,12 +334,16 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
         return s;
     }
     out->path = w->utf8_path;
+    /* FileId is the 64-bit NTFS/ReFS file reference. A rename's OLD/NEW
+     * halves share it; so does a delete-then-create that reuses the MFT
+     * entry. Downstream keys its pairing hashmap on this. */
+    out->event_correlation_id = (uint64_t)fni->FileId.QuadPart;
 
     /* Advance to next record in this buffer, or mark the buffer drained. */
     if (fni->NextEntryOffset == 0) {
         w->current = NULL;
     } else {
-        w->current = (FILE_NOTIFY_INFORMATION *)((BYTE *)fni + fni->NextEntryOffset);
+        w->current = (FILE_NOTIFY_EXTENDED_INFORMATION *)((BYTE *)fni + fni->NextEntryOffset);
     }
     watcher_release(w);
     return FILECAT_OK;

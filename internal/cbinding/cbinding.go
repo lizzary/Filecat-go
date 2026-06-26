@@ -57,13 +57,13 @@ func Open(path string, recursive bool) (*Watcher, int) {
 // occurs. The returned path string is copied out of the C-owned buffer here,
 // so the caller does not have to worry about the upstream "valid only until
 // the next call" lifetime contract.
-func (w *Watcher) NextEvent() (eventType int, path string, status int) {
+func (w *Watcher) NextEvent() (eventType int, path string, eventCorrelationId uint64, status int) {
 	var ev C.filecat_event_t
 	s := C.filecat_next_event(w.handle, &ev)
 	if s != C.FILECAT_OK {
-		return 0, "", int(s)
+		return 0, "", 0, int(s)
 	}
-	return int(ev._type), C.GoString(ev.path), 0
+	return int(ev._type), C.GoString(ev.path), uint64(ev.event_correlation_id), 0
 }
 
 // Close is thread-safe and idempotent; it unblocks any in-flight NextEvent

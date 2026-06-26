@@ -1,4 +1,4 @@
-#define _GNU_SOURCE 1
+filecat_mac.c#define _GNU_SOURCE 1
 
 #include "filecat/filecat.h"
 
@@ -571,6 +571,10 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
 
         out->type = map_inotify_mask(ev->mask);
         out->path = w->utf8_path;
+        /* Non-zero only on IN_MOVED_FROM / IN_MOVED_TO; the two halves of a
+         * single rename(2) share the same cookie. Downstream keys its
+         * rename-pairing hashmap on this. */
+        out->event_correlation_id = (uint64_t)ev->cookie;
         status = FILECAT_OK;
         goto out_release;
     }

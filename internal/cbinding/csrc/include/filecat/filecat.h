@@ -1,6 +1,8 @@
 #ifndef FILECAT_H
 #define FILECAT_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -29,7 +31,33 @@ typedef struct {
      * Owned by the watcher: valid only until the next filecat_next_event /
      * filecat_close call on the same watcher. */
     const char *path;
+
+    /* Pairing identifier. When non-zero, events sharing the same value
+     * refer to the same logical file / rename and should be correlated by
+     * the consumer (key your rename-pairing hashmap on this directly).
+     * Zero means the backend did not surface an id for this event.
+     *
+     * Linux:   inotify rename cookie. Non-zero on FILECAT_EVENT_RENAMED_OLD
+     *          / FILECAT_EVENT_RENAMED_NEW only; shared by the two halves
+     *          of a single rename(2). All other events are 0 — inotify
+     *          does not surface inodes, and on Linux a true create/delete
+     *          is never half of a move.
+     * Windows: 64-bit NTFS/ReFS FileId from FILE_NOTIFY_EXTENDED_INFORMATION.
+     *          Non-zero on every event for a real file; a rename's OLD/NEW
+     *          pair shares it, and a delete-then-create that reuses the
+     *          same MFT entry also shares it.
+     * macOS:   inode from FSEvents extended data. Non-zero on every event;
+     *          both halves of a rename share it (FSEvents does not pair
+     *          them itself — the consumer pairs on this id). */
+    uint64_t event_correlation_id;
 } filecat_event_t;
+
+/* Non-zero if this event carries a pairing id the consumer should correlate
+ * with other events sharing the same id. Defined as (ev->event_correlation_id
+ * != 0); exposed as a function purely for self-documenting call sites. */
+static inline int filecat_event_pairable(const filecat_event_t *ev) {
+    return ev->event_correlation_id != 0;
+}
 
 typedef struct filecat_watcher filecat_watcher_t;
 
