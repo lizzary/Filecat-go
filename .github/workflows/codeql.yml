@@ -21,32 +21,65 @@ concurrency:
 
 jobs:
   analyze:
-    name: Analyze (${{ matrix.language }})
-    runs-on: ${{ matrix.language == 'c-cpp' && 'ubuntu-latest' || 'ubuntu-latest' }}
+    name: Analyze (${{ matrix.language }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        language: [go, c-cpp]
+        include:
+          # Go is platform-independent for static analysis — run once.
+          - language: go
+            build-mode: none
+            os: ubuntu-latest
+          # C/C++: each platform compiles a different platform/*.c file
+          # via cgo build tags, so we have to actually run on that OS to
+          # let the CodeQL extractor see those translation units.
+          - language: c-cpp
+            build-mode: manual
+            os: ubuntu-latest
+          - language: c-cpp
+            build-mode: manual
+            os: macos-latest
+          - language: c-cpp
+            build-mode: manual
+            os: windows-latest
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
-        if: matrix.language == 'go'
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           check-latest: true
           cache: true
 
+      # Pin cgo to MinGW gcc on Windows so the CodeQL extractor hooks the
+      # same compiler the build actually invokes.
+      - name: Configure cgo toolchain (Windows)
+        if: runner.os == 'Windows' && matrix.build-mode == 'manual'
+        shell: pwsh
+        run: |
+          echo "CC=gcc" >> $env:GITHUB_ENV
+          echo "CGO_ENABLED=1" >> $env:GITHUB_ENV
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
+      - name: Manual build (cgo pulls platform C sources into the compile)
+        if: matrix.build-mode == 'manual'
+        env:
+          CGO_ENABLED: '1'
+        shell: bash
+        run: go build -v ./...
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
-          category: '/language:${{ matrix.language }}'
+          # Per-OS category so SARIF uploads from the three c-cpp runs
+          # don't collide in the Security tab; results stay separated by
+          # platform.
+          category: '/language:${{ matrix.language }}/os:${{ matrix.os }}'
