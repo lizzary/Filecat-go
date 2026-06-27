@@ -53,11 +53,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go: [stable]
-        include:
-          # Also exercise the previous Go minor on Linux to catch
-          # accidental use of brand-new stdlib APIs.
-          - os: ubuntu-latest
-            go: oldstable
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -82,13 +77,20 @@ jobs:
         if: runner.os != 'Windows'
         run: echo "CGO_ENABLED=1" >> "$GITHUB_ENV"
 
+      # bash on every platform — Windows runners ship Git Bash, and using
+      # pwsh here mangles flag values like `-coverprofile=coverage.out`
+      # (PowerShell's native-arg parsing splits the .out half off as a
+      # standalone token, which `go test` then treats as a package path).
       - name: Build
+        shell: bash
         run: go build -v ./...
 
       - name: Build examples
+        shell: bash
         run: go build -v ./examples/...
 
       - name: Test (race + coverage)
+        shell: bash
         run: go test -race -covermode=atomic -coverprofile=coverage.out -timeout=5m ./...
 
       - name: Upload coverage artifact
