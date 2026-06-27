@@ -28,8 +28,10 @@ jobs:
       matrix:
         include:
           # Go is platform-independent for static analysis — run once.
+          # The Go extractor does not support build-mode 'none', so we use
+          # 'manual' and drive the compile ourselves (same step as c-cpp).
           - language: go
-            build-mode: none
+            build-mode: manual
             os: ubuntu-latest
           # C/C++: each platform compiles a different platform/*.c file
           # via cgo build tags, so we have to actually run on that OS to
