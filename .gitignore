@@ -1,0 +1,38 @@
+# Compiled binaries and cgo intermediates
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+*.test
+*.out
+
+# Coverage and profiling output
+coverage.out
+coverage.html
+*.prof
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Build / dist directories
+/dist/
+/bin/
+/build/
+
+# IDE / editor metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Dependency directories from past tooling
+vendor/
