@@ -14,6 +14,9 @@ import "C"
 
 import "unsafe"
 
+// Status codes returned by the C ABI. They mirror the FILECAT_* constants
+// in filecat.h one-for-one; the parent package translates them into Go
+// errors via Strerror.
 const (
 	StatusOK            = 0
 	StatusErrInvalidArg = -1
@@ -24,6 +27,9 @@ const (
 	StatusErrClosed     = -6
 )
 
+// Raw event-type codes surfaced by the C ABI. RenamedOld / RenamedNew are
+// pre-coalescing halves of a rename; the parent package pairs them into a
+// single Move event before exposing them to consumers.
 const (
 	EventCreated    = 1
 	EventRemoved    = 2
@@ -32,10 +38,15 @@ const (
 	EventRenamedNew = 5
 )
 
+// Watcher is the cgo handle to a single C filecat_watcher_t. It is owned
+// by the parent package; treat it as opaque outside this module.
 type Watcher struct {
 	handle *C.filecat_watcher_t
 }
 
+// Open creates a watcher rooted at path. If recursive is true the watcher
+// observes the entire subtree, otherwise only direct children. The second
+// return is the C status code; it is StatusOK iff the watcher is valid.
 func Open(path string, recursive bool) (*Watcher, int) {
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
@@ -85,6 +96,8 @@ func (w *Watcher) Destroy() {
 	}
 }
 
+// Strerror renders one of the Status* codes as a human-readable string,
+// delegated to the C library so the wording stays in sync with the ABI.
 func Strerror(status int) string {
 	return C.GoString(C.filecat_strerror(C.filecat_status_t(status)))
 }
