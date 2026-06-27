@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0). Must already exist.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag and prerelease flag
+        id: resolve
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+            echo "::error::Tag '$tag' is not a valid semver tag (vMAJOR.MINOR.PATCH[-pre])."
+            exit 1
+          fi
+          prerelease=false
+          if [[ "$tag" == *-* ]]; then
+            prerelease=true
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build and test (smoke check on Linux)
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          go build ./...
+          go test -race -timeout=5m ./...
+
+  build-examples:
+    name: Build example (${{ matrix.os }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ''
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            ext: ''
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: '.exe'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build filecat-watch example
+        env:
+          CGO_ENABLED: '1'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        shell: bash
+        run: |
+          mkdir -p dist
+          out="dist/filecat-watch-${{ needs.verify.outputs.tag }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w" -o "$out" ./examples/watch
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filecat-watch-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs: [verify, build-examples]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          tag="${{ needs.verify.outputs.tag }}"
+          prev=$(git tag --sort=-v:refname | grep -v "^$tag$" | head -n1 || true)
+          {
+            echo "## What's changed"
+            echo
+            if [ -n "$prev" ]; then
+              git log --no-merges --pretty=format:'- %s (%h)' "$prev..$tag"
+              echo
+              echo
+              echo "**Full diff:** https://github.com/${{ github.repository }}/compare/$prev...$tag"
+            else
+              git log --no-merges --pretty=format:'- %s (%h)' "$tag"
+            fi
+          } > CHANGELOG_RELEASE.md
+          echo "---"
+          cat CHANGELOG_RELEASE.md
+          echo "---"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify.outputs.tag }}
+          name: ${{ needs.verify.outputs.tag }}
+          body_path: CHANGELOG_RELEASE.md
+          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
+
+      - name: Prime Go module proxy
+        shell: bash
+        env:
+          GOPROXY: proxy.golang.org
+        run: |
+          # Best-effort: ask proxy.golang.org to fetch the new version so
+          # `go get` works immediately. Non-fatal if the proxy is slow.
+          mod=$(go list -m)
+          tag="${{ needs.verify.outputs.tag }}"
+          curl -fsSL "https://proxy.golang.org/${mod}/@v/${tag}.info" || \
+            echo "::warning::Proxy did not return version info yet — it will populate within a few minutes."

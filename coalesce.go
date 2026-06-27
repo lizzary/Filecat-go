@@ -17,13 +17,29 @@ type rawEvent struct {
 	correlationID uint64
 }
 
+// run drives the watcher's two goroutines: readLoop (which blocks in the C
+// ABI's filecat_next_event) and the coalescer (this goroutine).
+//
+// The <-rlDone join at the end is load-bearing. It guarantees readLoop has
+// returned from its final cw.NextEvent before run returns — and run returning
+// is what closes w.done, which is what unblocks Close's <-w.done and lets it
+// call cw.Destroy. Without the join, Destroy (which frees the C watcher)
+// could race a readLoop still parked inside filecat_next_event: a
+// use-after-free, since the C core does not reference-count in-flight calls.
+// This is exactly the close → join reader → destroy ordering the C ABI
+// requires of its callers (see the C core's DESIGN.md §6.3).
 func (w *Watcher) run() {
 	defer close(w.done)
 	defer close(w.events)
 
 	rawCh := make(chan rawEvent, 256)
-	go w.readLoop(rawCh)
+	rlDone := make(chan struct{})
+	go func() {
+		defer close(rlDone)
+		w.readLoop(rawCh)
+	}()
 	w.coalesceLoop(rawCh)
+	<-rlDone
 }
 
 // readLoop pulls events off the blocking C ABI and forwards them to the
@@ -78,12 +94,22 @@ func (w *Watcher) coalesceLoop(in <-chan rawEvent) {
 		if batch == nil {
 			return
 		}
-		for _, fe := range batch.drain() {
+		for _, p := range batch.drain() {
+			fe := p.fe
 			fe.Path = filepath.Join(w.root, fe.Path)
 			if fe.OldPath != "" {
 				fe.OldPath = filepath.Join(w.root, fe.OldPath)
 			}
-			fe = resolveMove(fe)
+			// A provisional Removed that came from an unpaired RENAMED_OLD
+			// (macOS half-move) may actually be a move *into* the watch;
+			// resolveHalfMove probes the disk to decide. Paired Moves go
+			// through resolveMove for direction disambiguation. Both hooks
+			// are no-ops on Linux/Windows.
+			if p.fromHalf {
+				fe = resolveHalfMove(fe)
+			} else {
+				fe = resolveMove(fe)
+			}
 			select {
 			case w.events <- fe:
 			case <-w.closed:
@@ -120,6 +146,16 @@ func (w *Watcher) coalesceLoop(in <-chan rawEvent) {
 	}
 }
 
+// pendingFE is a committed event plus the metadata the flush step needs
+// to finalize it. fromHalf marks an event that began life as an unpaired
+// RENAMED_OLD: on macOS that is ambiguous between a move-out (Removed)
+// and a move-in (Created), so the flusher routes it through
+// resolveHalfMove instead of resolveMove.
+type pendingFE struct {
+	fe       FileEvent
+	fromHalf bool
+}
+
 // batchState holds the in-flight coalescing state for one settle window.
 //
 //   - pending: pair-eligible events (CREATED / REMOVED / RENAMED_*) waiting
@@ -129,7 +165,7 @@ func (w *Watcher) coalesceLoop(in <-chan rawEvent) {
 //     the same path within the window (absorbs Windows write storms).
 type batchState struct {
 	pending        map[uint64]rawEvent
-	out            []FileEvent
+	out            []pendingFE
 	lastModifiedAt map[string]int
 }
 
@@ -181,11 +217,11 @@ func (b *batchState) tryPair(first, second rawEvent) bool {
 	case first.typ == cbinding.EventRenamedOld && second.typ == cbinding.EventRenamedNew,
 		first.typ == cbinding.EventRenamedOld && second.typ == cbinding.EventRenamedOld,
 		first.typ == cbinding.EventRemoved && second.typ == cbinding.EventCreated:
-		b.out = append(b.out, FileEvent{
+		b.out = append(b.out, pendingFE{fe: FileEvent{
 			Type:    EventMove,
 			OldPath: first.path,
 			Path:    second.path,
-		})
+		}})
 		return true
 	}
 	return false
@@ -196,18 +232,26 @@ func (b *batchState) recordModified(path string) {
 		return
 	}
 	b.lastModifiedAt[path] = len(b.out)
-	b.out = append(b.out, FileEvent{Type: EventModified, Path: path})
+	b.out = append(b.out, pendingFE{fe: FileEvent{Type: EventModified, Path: path}})
 }
 
 // commit translates a single raw event to FileEvent and appends to out.
-// Unpaired RENAMED_OLD becomes Removed (half-move out of watch); unpaired
-// RENAMED_NEW becomes Created (half-move into watch).
+//
+// Unpaired RENAMED_NEW becomes Created (Linux half-move into watch).
+// Unpaired RENAMED_OLD becomes Removed *provisionally* and is flagged
+// fromHalf: on Linux/Windows that direction is final (move-out), but on
+// macOS — where both halves of a rename surface as RENAMED_OLD — the
+// surviving half could be a move-in, so resolveHalfMove re-checks against
+// the disk at flush time. A genuine REMOVED (real delete) is never
+// flagged, so it is never reclassified.
 func (b *batchState) commit(ev rawEvent) {
 	switch ev.typ {
 	case cbinding.EventCreated, cbinding.EventRenamedNew:
-		b.out = append(b.out, FileEvent{Type: EventCreated, Path: ev.path})
-	case cbinding.EventRemoved, cbinding.EventRenamedOld:
-		b.out = append(b.out, FileEvent{Type: EventRemoved, Path: ev.path})
+		b.out = append(b.out, pendingFE{fe: FileEvent{Type: EventCreated, Path: ev.path}})
+	case cbinding.EventRemoved:
+		b.out = append(b.out, pendingFE{fe: FileEvent{Type: EventRemoved, Path: ev.path}})
+	case cbinding.EventRenamedOld:
+		b.out = append(b.out, pendingFE{fe: FileEvent{Type: EventRemoved, Path: ev.path}, fromHalf: true})
 	case cbinding.EventModified:
 		b.recordModified(ev.path)
 	}
@@ -216,7 +260,7 @@ func (b *batchState) commit(ev rawEvent) {
 // drain finalizes the batch: pending entries that never found a mate are
 // flushed as their single-event equivalent, then the ordered output slice
 // is returned.
-func (b *batchState) drain() []FileEvent {
+func (b *batchState) drain() []pendingFE {
 	for _, ev := range b.pending {
 		b.commit(ev)
 	}

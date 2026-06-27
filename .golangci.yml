@@ -1,0 +1,71 @@
+run:
+  timeout: 5m
+  # cgo-using packages: let the linter see the cgo-generated files.
+  build-tags: []
+  tests: true
+
+output:
+  formats:
+    - format: colored-line-number
+  sort-results: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+    - bodyclose
+    - copyloopvar
+    - nolintlint
+    - prealloc
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/lizzary/filecat-go
+  revive:
+    rules:
+      - name: exported
+        disabled: false
+        arguments:
+          - disableStutteringCheck
+      - name: var-naming
+      - name: indent-error-flow
+      - name: errorf
+      - name: error-return
+      - name: error-strings
+      - name: receiver-naming
+      - name: unused-parameter
+        disabled: true
+  staticcheck:
+    checks: ["all"]
+  errcheck:
+    # Don't fail on deferred Close() — it's idiomatic in this codebase.
+    exclude-functions:
+      - (io.Closer).Close
+      - (*os.File).Close
+
+issues:
+  exclude-rules:
+    # Tests can be loose about error wrapping and unused params.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - unparam
+        - revive
+    # cgo wrapper has to use C-shaped identifiers and unsafe.
+    - path: internal/cbinding/
+      linters:
+        - revive
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-use-default: false

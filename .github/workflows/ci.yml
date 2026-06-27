@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+  test:
+    name: Test (${{ matrix.os }} / Go ${{ matrix.go }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: [stable]
+        include:
+          # Also exercise the previous Go minor on Linux to catch
+          # accidental use of brand-new stdlib APIs.
+          - os: ubuntu-latest
+            go: oldstable
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+          cache: true
+
+      # cgo on Windows runners needs an MSYS2 mingw-w64 toolchain.
+      # The default windows-latest image already ships one, but pin it here
+      # so the build keeps working if the image swaps to clang.
+      - name: Configure cgo toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "CC=gcc" >> $env:GITHUB_ENV
+          echo "CGO_ENABLED=1" >> $env:GITHUB_ENV
+
+      - name: Configure cgo toolchain (Unix)
+        if: runner.os != 'Windows'
+        run: echo "CGO_ENABLED=1" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Build examples
+        run: go build -v ./examples/...
+
+      - name: Test (race + coverage)
+        run: go test -race -covermode=atomic -coverprofile=coverage.out -timeout=5m ./...
+
+      - name: Upload coverage artifact
+        if: matrix.os == 'ubuntu-latest' && matrix.go == 'stable'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-${{ matrix.go }}
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 14
+
+  tidy:
+    name: go mod tidy is clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: Tidy and diff
+        run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go.mod / go.sum are not tidy. Run 'go mod tidy' locally."
+            exit 1
+          fi

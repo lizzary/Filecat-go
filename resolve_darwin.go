@@ -33,6 +33,33 @@ func resolveMove(ev FileEvent) FileEvent {
 	return ev
 }
 
+// resolveHalfMove disambiguates an unpaired RENAMED_OLD on macOS.
+//
+// FSEvents reports both halves of a rename as RENAMED_OLD. When only one
+// half lands inside the watch (a "half-move") the coalescer cannot pair
+// it, and commit provisionally types it as Removed. But the surviving
+// half could equally be a move *into* the watch, in which case the path
+// now exists on disk and the correct event is Created.
+//
+// By the time the settle window flushes, the move has almost always
+// settled to disk, so we probe: if the path exists it was a move-in
+// (rewrite to Created); otherwise it stays a move-out (Removed). On an
+// inconclusive stat (EACCES, network FS) pathExists returns true, which
+// would flip a real move-out to Created — so we only trust "exists" as
+// evidence of a move-in and keep Removed on every other outcome by
+// checking the negative: a path that definitively does NOT exist is a
+// move-out and already has the right type.
+func resolveHalfMove(ev FileEvent) FileEvent {
+	if ev.Type != EventRemoved || ev.Path == "" {
+		return ev
+	}
+	if _, err := os.Lstat(ev.Path); err == nil {
+		// Path is present → the watched half is the destination.
+		ev.Type = EventCreated
+	}
+	return ev
+}
+
 func pathExists(p string) bool {
 	if _, err := os.Lstat(p); err == nil {
 		return true

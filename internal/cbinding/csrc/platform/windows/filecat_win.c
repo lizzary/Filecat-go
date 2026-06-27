@@ -35,11 +35,15 @@ struct filecat_watcher {
     char   *utf8_path;                         /* scratch UTF-8 buffer returned via event.path */
     int     utf8_capacity;
 
-    /* Lifecycle bookkeeping. All accessed via Interlocked*; reads use the
-     * no-op CAS idiom InterlockedCompareExchange(&x, 0, 0). */
-    volatile LONG refcount;   /* 1 owner ref + 1 per in-flight call */
-    volatile LONG closing;    /* set-once latch (0 -> 1) */
-    volatile LONG destroyed;  /* set-once latch (0 -> 1); guards owner-ref drop */
+    /* close ∥ next_event handshake. Set-once latch (0 -> 1) flipped by
+     * filecat_close from any thread to cancel a blocking next_event. Written
+     * with InterlockedExchange, read with InterlockedCompareExchange (an
+     * atomic acquire-load) so the cancel is observed even in the bare-window
+     * case (consumer between two reads, where CancelIoEx has no pending I/O
+     * to abort) and on weakly-ordered archs, not just x86/x64. No refcount /
+     * destroyed latch: the watcher's memory lifetime is owned by the caller
+     * per the filecat_destroy contract (the consumer must have exited first). */
+    volatile LONG closing;
 };
 
 static filecat_status_t map_win_error(DWORD err)
@@ -163,64 +167,26 @@ static filecat_status_t store_event_path(filecat_watcher_t *w,
     return FILECAT_OK;
 }
 
-/* ---- refcount + close latches --------------------------------------------
+/* ---- lifecycle model (caller-managed, no refcount) -----------------------
  *
- * Lifetime model:
- *   - filecat_open initializes refcount=1 (the owner ref).
- *   - filecat_next_event / filecat_close retain at entry, release at exit.
- *   - filecat_destroy CAS-sets the `destroyed` latch (so only one call drops
- *     the owner ref) and then releases.
- *   - The last release does the real free.
+ *   - filecat_open returns a watcher owned by the caller.
+ *   - filecat_close may be called from any thread, any number of times, to
+ *     cancel a blocking filecat_next_event. It flips `closing` and issues
+ *     CancelIoEx; it does NOT close the directory handle.
+ *   - filecat_destroy closes the handle and frees the watcher. Per the ABI
+ *     contract the caller guarantees the consumer has already observed
+ *     FILECAT_ERR_CLOSED and will not touch the watcher again, and that
+ *     exactly one thread calls destroy — so no in-flight call can race the
+ *     free and no reference counting is needed.
  *
- * `closing` is a set-once latch separate from `destroyed`: filecat_close flips
- * `closing` (without touching `destroyed`), filecat_destroy flips both. The
- * actual CloseHandle is gated by `closing` so it runs exactly once.
- */
-
-static void watcher_free(filecat_watcher_t *w)
-{
-    /* Refcount has just dropped to 0. Paranoid: if no close ever happened,
-     * close the handle now. */
-    HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID volatile *)&w->hDir, NULL);
-    if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    free(w->buffer);
-    free(w->utf8_path);
-    free(w);
-}
-
-static void watcher_retain(filecat_watcher_t *w)
-{
-    InterlockedIncrement(&w->refcount);
-}
-
-static void watcher_release(filecat_watcher_t *w)
-{
-    if (InterlockedDecrement(&w->refcount) == 0) {
-        watcher_free(w);
-    }
-}
-
-/* Flip the `closing` latch and close the directory handle exactly once.
- * Idempotent and thread-safe.
- *
- * CancelIoEx is required to wake a consumer thread that is parked inside
- * a synchronous ReadDirectoryChangesW: CloseHandle alone does NOT cancel
- * an in-flight sync I/O on a directory handle — the kernel keeps the
- * underlying file object alive until the I/O completes, and a directory-
- * change wait completes only when an event arrives. CancelIoEx (Vista+,
- * NULL OVERLAPPED targets every pending operation on the handle) aborts
- * the wait so RDCW returns ERROR_OPERATION_ABORTED, which our caller
- * maps to FILECAT_ERR_CLOSED. */
-static void watcher_close_handle(filecat_watcher_t *w)
-{
-    if (InterlockedExchange(&w->closing, 1) == 0) {
-        HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID volatile *)&w->hDir, NULL);
-        if (h && h != INVALID_HANDLE_VALUE) {
-            CancelIoEx(h, NULL);
-            CloseHandle(h);
-        }
-    }
-}
+ * Why CancelIoEx: a consumer parked inside synchronous ReadDirectoryChangesExW
+ * is not woken by anything short of an event or an explicit cancel. CancelIoEx
+ * (NULL OVERLAPPED targets every pending op on the handle) aborts the wait so
+ * RDCW returns ERROR_OPERATION_ABORTED, mapped to FILECAT_ERR_CLOSED. The
+ * handle deliberately stays open until destroy: a close landing between two
+ * reads would otherwise invalidate the handle the consumer is about to reuse.
+ * The `closing` latch covers that gap — the consumer checks it before each
+ * read, so a close that finds no pending I/O to cancel is still observed. */
 
 filecat_status_t filecat_open(const char *path, int recursive, filecat_watcher_t **out)
 {
@@ -269,8 +235,7 @@ filecat_status_t filecat_open(const char *path, int recursive, filecat_watcher_t
     }
     w->hDir          = h;
     w->bWatchSubtree = recursive ? TRUE : FALSE;
-    /* current, utf8_path, utf8_capacity, closing, destroyed already 0 from calloc */
-    w->refcount      = 1;  /* owner ref, released by filecat_destroy */
+    /* current, utf8_path, utf8_capacity, closing already 0 from calloc */
 
     *out = w;
     return FILECAT_OK;
@@ -279,30 +244,27 @@ filecat_status_t filecat_open(const char *path, int recursive, filecat_watcher_t
 filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
 {
     if (!w || !out) return FILECAT_ERR_INVALID_ARG;
-    watcher_retain(w);
 
-    /* Fast path: another thread already requested close. Skip the kernel
-     * call entirely and exit. */
-    if (InterlockedCompareExchange(&w->closing, 0, 0) != 0) {
-        watcher_release(w);
+    /* close ∥ next_event: another thread may flip `closing` to cancel us.
+     * Check before entering the kernel — CancelIoEx only aborts an I/O that
+     * is already pending, so a close that lands while we're between reads
+     * (draining the buffer, or back in the caller) would otherwise be missed
+     * until the next real event arrives. InterlockedCompareExchange(_,0,0) is
+     * an atomic acquire-load that pairs with the InterlockedExchange in
+     * filecat_close. */
+    if (InterlockedCompareExchange(&w->closing, 0, 0) != 0)
         return FILECAT_ERR_CLOSED;
-    }
 
     /* Drain any leftover records from the previous read first. */
     if (w->current == NULL) {
-        /* Snapshot the handle once: close may NULL it out from another
-         * thread; the kernel call will then fail with ERROR_INVALID_HANDLE
-         * which we map to FILECAT_ERR_CLOSED. */
         HANDLE h = w->hDir;
-        if (h == NULL || h == INVALID_HANDLE_VALUE) {
-            watcher_release(w);
-            return FILECAT_ERR_CLOSED;
-        }
         DWORD bytes = 0;
         /* ReadDirectoryChangesExW with ReadDirectoryNotifyExtendedInformation
          * fills the buffer with FILE_NOTIFY_EXTENDED_INFORMATION records,
          * which carry the NTFS FileId (and ParentFileId, timestamps, size,
-         * attrs) alongside the action and name. Win10 1709+ / Win11. */
+         * attrs) alongside the action and name. Win10 1709+ / Win11. A
+         * concurrent filecat_close calls CancelIoEx on this handle, which
+         * makes the call fail with ERROR_OPERATION_ABORTED -> FILECAT_ERR_CLOSED. */
         BOOL ok = ReadDirectoryChangesExW(
             h, w->buffer, FILECAT_BUFFER_SIZE,
             w->bWatchSubtree, FILECAT_NOTIFY_FILTER,
@@ -311,14 +273,11 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
             NULL,    /* no completion routine */
             ReadDirectoryNotifyExtendedInformation);
         if (!ok) {
-            DWORD err = GetLastError();
-            watcher_release(w);
-            return map_win_error(err);
+            return map_win_error(GetLastError());
         }
         if (bytes == 0) {
             /* Documented overflow signal for synchronous calls. The kernel
              * buffer was drained; subsequent reads will receive new events. */
-            watcher_release(w);
             return FILECAT_ERR_OVERFLOW;
         }
         w->current = (FILE_NOTIFY_EXTENDED_INFORMATION *)w->buffer;
@@ -330,7 +289,6 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
     int wlen_chars = (int)(fni->FileNameLength / sizeof(WCHAR));
     filecat_status_t s = store_event_path(w, fni->FileName, wlen_chars);
     if (s != FILECAT_OK) {
-        watcher_release(w);
         return s;
     }
     out->path = w->utf8_path;
@@ -345,28 +303,35 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
     } else {
         w->current = (FILE_NOTIFY_EXTENDED_INFORMATION *)((BYTE *)fni + fni->NextEntryOffset);
     }
-    watcher_release(w);
     return FILECAT_OK;
 }
 
 void filecat_close(filecat_watcher_t *w)
 {
     if (!w) return;
-    watcher_retain(w);
-    watcher_close_handle(w);
-    watcher_release(w);
+    /* Wake a blocking next_event. Idempotent and safe from any thread: both
+     * InterlockedExchange and an extra CancelIoEx are harmless if repeated.
+     * The handle is NOT closed here — that happens in filecat_destroy, after
+     * the consumer has exited — so a close racing a next_event between reads
+     * cannot pull the handle out from under it. */
+    InterlockedExchange(&w->closing, 1);
+    HANDLE h = w->hDir;
+    if (h && h != INVALID_HANDLE_VALUE) CancelIoEx(h, NULL);
 }
 
 void filecat_destroy(filecat_watcher_t *w)
 {
     if (!w) return;
-    /* CAS-once: only the first destroy actually drops the owner ref.
-     * Concurrent destroy calls on a still-valid pointer are safe. */
-    if (InterlockedExchange(&w->destroyed, 1) != 0) return;
-    /* Ensure the handle is closed even if filecat_close was never called. */
-    watcher_close_handle(w);
-    /* Drop the owner ref. Frees w once the last in-flight call releases. */
-    watcher_release(w);
+    /* Contract: the consumer has already observed FILECAT_ERR_CLOSED and will
+     * not call any filecat_* on `w` again; exactly one thread calls destroy.
+     * So we can close the handle and free without any reference counting. */
+    if (w->hDir && w->hDir != INVALID_HANDLE_VALUE) {
+        CloseHandle(w->hDir);
+        w->hDir = NULL;
+    }
+    free(w->buffer);
+    free(w->utf8_path);
+    free(w);
 }
 
 const char *filecat_strerror(filecat_status_t status)

@@ -1,7 +1,8 @@
 /* Filecat — macOS backend (FSEvents v2 + extended data + dispatch queue).
  *
- * The lifecycle model (refcount + two set-once latches) is the same as the
- * Windows and Linux backends; only the I/O substrate differs. FSEvents
+ * The lifecycle model (caller-managed, a single `closing` latch, no
+ * refcount) is the same as the Windows and Linux backends; only the I/O
+ * substrate differs. FSEvents
  * pushes batches of events into a callback running on a serial dispatch
  * queue; the callback strips the watch root, classifies each event, reads
  * the inode out of kFSEventStreamEventExtendedFileIDKey, and appends nodes
@@ -68,13 +69,13 @@ struct filecat_watcher {
     char  *utf8_path;
     size_t utf8_capacity;
 
-    /* lifecycle (mirror of Windows / Linux backends):
-     *   refcount  = 1 owner ref + 1 per in-flight call; last drop frees.
-     *   closing   = set-once latch; gates FSEvents teardown exactly once.
-     *   destroyed = set-once latch; gates owner-ref drop exactly once. */
-    atomic_int refcount;
+    /* close ∥ next_event handshake. `closing` is a set-once latch flipped by
+     * filecat_close (any thread): the FSEvents callback drops its batch once
+     * it is set, and next_event observes it and returns FILECAT_ERR_CLOSED.
+     * No refcount / destroyed latch — the watcher's memory is owned by the
+     * caller per the filecat_destroy contract (the consumer must have exited
+     * first). */
     atomic_int closing;
-    atomic_int destroyed;
 };
 
 /* ---- error mapping ----------------------------------------------------- */
@@ -280,20 +281,22 @@ static void fsevents_cb(ConstFSEventStreamRef stream,
     pthread_mutex_unlock(&w->mu);
 }
 
-/* ---- refcount + close latches ----------------------------------------- *
+/* ---- lifecycle (caller-managed, no refcount) -------------------------- *
  *
- * Lifetime model (verbatim mirror of the Windows backend):
- *   - filecat_open initializes refcount=1 (the owner ref).
- *   - filecat_next_event / filecat_close retain at entry, release at exit.
- *   - filecat_destroy CAS-sets `destroyed` (so only one call drops the
- *     owner ref) and then releases.
- *   - The last release does the real free.
+ *   - filecat_open returns a watcher owned by the caller.
+ *   - filecat_close may be called from any thread, any number of times, to
+ *     wake a blocking next_event: it flips `closing` and broadcasts the
+ *     condvar. It does NOT tear down the FSEvents stream.
+ *   - filecat_destroy tears down the stream, fences the serial queue so no
+ *     callback is still running against `w`, then frees. Per the ABI contract
+ *     the consumer has exited and exactly one thread calls destroy, so no
+ *     in-flight call can race the free and no reference counting is needed.
  */
 
 static void watcher_free(filecat_watcher_t *w)
 {
-    /* The stream has been torn down inside watcher_close_internal by the
-     * time we get here; the queue is still owned by us. */
+    /* The stream has been torn down in filecat_destroy and the serial queue
+     * fenced by the time we get here; the queue handle is still ours. */
     if (w->queue) dispatch_release(w->queue);
 
     /* Drain any events that were enqueued but never consumed. */
@@ -312,48 +315,9 @@ static void watcher_free(filecat_watcher_t *w)
     free(w);
 }
 
-static void watcher_retain(filecat_watcher_t *w)
-{
-    atomic_fetch_add_explicit(&w->refcount, 1, memory_order_relaxed);
-}
-
-static void watcher_release(filecat_watcher_t *w)
-{
-    if (atomic_fetch_sub_explicit(&w->refcount, 1, memory_order_acq_rel) == 1)
-        watcher_free(w);
-}
-
 /* No-op used by dispatch_sync_f to "fence" the serial queue: when it
  * runs, every previously-submitted callback has finished. */
 static void noop_dispatch_fn(void *ctx) { (void)ctx; }
-
-static void watcher_close_internal(filecat_watcher_t *w)
-{
-    int expected = 0;
-    if (!atomic_compare_exchange_strong(&w->closing, &expected, 1)) return;
-
-    /* Tear down the FSEvents stream. After Invalidate no new callback will
-     * be delivered for this stream. Release drops our +1 ref. */
-    if (w->stream) {
-        FSEventStreamStop(w->stream);
-        FSEventStreamInvalidate(w->stream);
-        FSEventStreamRelease(w->stream);
-        w->stream = NULL;
-    }
-
-    /* Drain any callback that was already in flight on the serial queue.
-     * Once this returns, no callback can still be executing against `w`. */
-    if (w->queue) {
-        dispatch_sync_f(w->queue, NULL, noop_dispatch_fn);
-    }
-
-    /* Wake any consumer parked in pthread_cond_wait. The broadcast is done
-     * under the mutex so the standard `while (predicate) cond_wait` idiom
-     * in filecat_next_event can't miss the signal. */
-    pthread_mutex_lock(&w->mu);
-    pthread_cond_broadcast(&w->cv);
-    pthread_mutex_unlock(&w->mu);
-}
 
 /* ---- public API ------------------------------------------------------- */
 
@@ -383,9 +347,7 @@ filecat_status_t filecat_open(const char *path, int recursive,
     w->root      = root;
     w->root_len  = strlen(root);
     w->recursive = recursive ? 1 : 0;
-    atomic_init(&w->refcount,  1);
-    atomic_init(&w->closing,   0);
-    atomic_init(&w->destroyed, 0);
+    atomic_init(&w->closing, 0);
 
     if (pthread_mutex_init(&w->mu, NULL) != 0) {
         free(w->root); free(w);
@@ -471,19 +433,16 @@ filecat_status_t filecat_open(const char *path, int recursive,
 filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
 {
     if (!w || !out) return FILECAT_ERR_INVALID_ARG;
-    watcher_retain(w);
 
     pthread_mutex_lock(&w->mu);
     for (;;) {
         if (atomic_load_explicit(&w->closing, memory_order_acquire)) {
             pthread_mutex_unlock(&w->mu);
-            watcher_release(w);
             return FILECAT_ERR_CLOSED;
         }
         if (w->overflow_pending) {
             w->overflow_pending = 0;
             pthread_mutex_unlock(&w->mu);
-            watcher_release(w);
             return FILECAT_ERR_OVERFLOW;
         }
         if (w->head) break;
@@ -504,7 +463,6 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
         if (!p) {
             free(n->rel_path);
             free(n);
-            watcher_release(w);
             return FILECAT_ERR_NO_MEMORY;
         }
         w->utf8_path     = p;
@@ -519,25 +477,42 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
     free(n->rel_path);
     free(n);
 
-    watcher_release(w);
     return FILECAT_OK;
 }
 
 void filecat_close(filecat_watcher_t *w)
 {
     if (!w) return;
-    watcher_retain(w);
-    watcher_close_internal(w);
-    watcher_release(w);
+    /* Wake a consumer parked in pthread_cond_wait. Done under the mutex so
+     * the `while (predicate) cond_wait` idiom in next_event can't miss the
+     * signal. Idempotent and safe from any thread; the FSEvents stream is
+     * torn down later, in filecat_destroy. */
+    pthread_mutex_lock(&w->mu);
+    atomic_store_explicit(&w->closing, 1, memory_order_release);
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mu);
 }
 
 void filecat_destroy(filecat_watcher_t *w)
 {
     if (!w) return;
-    int expected = 0;
-    if (!atomic_compare_exchange_strong(&w->destroyed, &expected, 1)) return;
-    watcher_close_internal(w);
-    watcher_release(w);   /* drop owner ref */
+    /* Contract: the consumer has exited (saw FILECAT_ERR_CLOSED) and exactly
+     * one thread calls destroy. Set `closing` first so any FSEvents callback
+     * racing the teardown drops its batch instead of appending to a queue
+     * we're about to free; stop+invalidate the stream so no new callback is
+     * scheduled; then fence the serial queue so any in-flight callback has
+     * finished touching `w` before we free it. */
+    atomic_store_explicit(&w->closing, 1, memory_order_release);
+    if (w->stream) {
+        FSEventStreamStop(w->stream);
+        FSEventStreamInvalidate(w->stream);
+        FSEventStreamRelease(w->stream);
+        w->stream = NULL;
+    }
+    if (w->queue) {
+        dispatch_sync_f(w->queue, NULL, noop_dispatch_fn);
+    }
+    watcher_free(w);
 }
 
 const char *filecat_strerror(filecat_status_t status)

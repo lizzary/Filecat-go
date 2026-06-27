@@ -1,4 +1,4 @@
-filecat_mac.c#define _GNU_SOURCE 1
+#define _GNU_SOURCE 1
 
 #include "filecat/filecat.h"
 
@@ -51,15 +51,13 @@ struct filecat_watcher {
     char  *utf8_path;             /* scratch returned via event.path */
     size_t utf8_capacity;
 
-    /* Lifecycle: mirror the Windows backend.
-     *   refcount = 1 owner + 1 per in-flight call; last release frees.
-     *   closing  = set-once latch flipped by close/destroy; gates the
-     *              cancel-eventfd write so it runs exactly once.
-     *   destroyed = set-once latch flipped by destroy; gates the owner
-     *               ref drop so destroy is safe to race with itself. */
-    atomic_int refcount;
+    /* close ∥ next_event handshake. `closing` is a set-once latch flipped by
+     * filecat_close (any thread) to cancel a blocking next_event: the
+     * consumer checks it, and the cancel-eventfd write wakes a parked poll().
+     * No refcount / destroyed latch — the watcher's memory is owned by the
+     * caller per the filecat_destroy contract (the consumer must have exited
+     * first). */
     atomic_int closing;
-    atomic_int destroyed;
 };
 
 /* ---- error mapping ----------------------------------------------------- */
@@ -293,19 +291,16 @@ static void descend_and_watch(filecat_watcher_t *w, const char *rel)
     closedir(d);
 }
 
-/* ---- refcount + close latches ------------------------------------------
+/* ---- lifecycle (caller-managed, no refcount) ---------------------------
  *
- * Lifetime model (mirror of Windows backend):
- *   - filecat_open initializes refcount=1 (the owner ref).
- *   - filecat_next_event / filecat_close retain at entry, release at exit.
- *   - filecat_destroy CAS-sets the `destroyed` latch (so only one call
- *     drops the owner ref) and then releases.
- *   - The last release does the real free.
- *
- * `closing` is a set-once latch separate from `destroyed`: filecat_close
- * flips `closing` (without touching `destroyed`); filecat_destroy flips
- * both. The eventfd write (which unblocks the consumer's poll) is gated by
- * `closing` so it runs exactly once.
+ *   - filecat_open returns a watcher owned by the caller.
+ *   - filecat_close may be called from any thread, any number of times, to
+ *     cancel a blocking filecat_next_event: it flips `closing` and writes the
+ *     cancel eventfd to wake a parked poll(). It does NOT close any fd.
+ *   - filecat_destroy closes the fds and frees the watcher. Per the ABI
+ *     contract the consumer has already observed FILECAT_ERR_CLOSED and will
+ *     not touch the watcher again, and exactly one thread calls destroy — so
+ *     no in-flight call can race the free and no reference counting is needed.
  */
 
 static void watcher_free(filecat_watcher_t *w)
@@ -319,23 +314,12 @@ static void watcher_free(filecat_watcher_t *w)
     free(w);
 }
 
-static void watcher_retain(filecat_watcher_t *w)
+static void watcher_signal_close(filecat_watcher_t *w)
 {
-    atomic_fetch_add_explicit(&w->refcount, 1, memory_order_relaxed);
-}
-
-static void watcher_release(filecat_watcher_t *w)
-{
-    if (atomic_fetch_sub_explicit(&w->refcount, 1, memory_order_acq_rel) == 1)
-        watcher_free(w);
-}
-
-static void watcher_close_internal(filecat_watcher_t *w)
-{
-    int expected = 0;
-    if (!atomic_compare_exchange_strong(&w->closing, &expected, 1)) return;
-    /* Wake any consumer parked in poll(). The fd may already be drained or
-     * full; either way the consumer wakes. */
+    /* Idempotent: re-setting the latch is a no-op, and an extra eventfd
+     * write just bumps the counter — a parked poll() still wakes. The fds
+     * stay open until filecat_destroy. */
+    atomic_store_explicit(&w->closing, 1, memory_order_release);
     uint64_t one = 1;
     ssize_t r;
     do { r = write(w->cancel_fd, &one, sizeof(one)); }
@@ -455,9 +439,7 @@ filecat_status_t filecat_open(const char *path, int recursive, filecat_watcher_t
     w->root       = root;
     w->root_len   = strlen(root);
     w->recursive  = recursive ? 1 : 0;
-    atomic_init(&w->refcount,  1);
-    atomic_init(&w->closing,   0);
-    atomic_init(&w->destroyed, 0);
+    atomic_init(&w->closing, 0);
 
     w->inotify_fd = inotify_init1(IN_CLOEXEC);
     if (w->inotify_fd < 0) {
@@ -496,7 +478,6 @@ filecat_status_t filecat_open(const char *path, int recursive, filecat_watcher_t
 filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
 {
     if (!w || !out) return FILECAT_ERR_INVALID_ARG;
-    watcher_retain(w);
 
     filecat_status_t status = FILECAT_OK;
 
@@ -580,25 +561,23 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
     }
 
 out_release:
-    watcher_release(w);
+    /* Single exit point. Nothing to release now that the watcher is
+     * caller-owned; the label name is kept to avoid churning the gotos. */
     return status;
 }
 
 void filecat_close(filecat_watcher_t *w)
 {
     if (!w) return;
-    watcher_retain(w);
-    watcher_close_internal(w);
-    watcher_release(w);
+    watcher_signal_close(w);
 }
 
 void filecat_destroy(filecat_watcher_t *w)
 {
     if (!w) return;
-    int expected = 0;
-    if (!atomic_compare_exchange_strong(&w->destroyed, &expected, 1)) return;
-    watcher_close_internal(w);
-    watcher_release(w);   /* drop owner ref */
+    /* Contract: the consumer has exited (saw FILECAT_ERR_CLOSED) and exactly
+     * one thread calls destroy, so we can close the fds and free directly. */
+    watcher_free(w);
 }
 
 const char *filecat_strerror(filecat_status_t status)

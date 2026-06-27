@@ -78,17 +78,18 @@ filecat_status_t filecat_open(const char *path, int recursive, filecat_watcher_t
 
 /* Block until the next event is available, then fill `out`.
  *
- * Returns FILECAT_ERR_CLOSED once another thread has called filecat_close
- * (or filecat_destroy without prior close).
+ * Returns FILECAT_ERR_CLOSED once another thread has called filecat_close.
  *
  * On FILECAT_ERR_OVERFLOW the watcher remains valid; the caller may keep
  * calling filecat_next_event (subsequent events arrive normally; the lost ones
  * are not recoverable).
  *
- * Not safe to call concurrently with itself on the same watcher (only one
- * consumer at a time). It IS safe to race with filecat_close /
- * filecat_destroy from other threads -- the call will then return
- * FILECAT_ERR_CLOSED.
+ * Threading: at most one thread may call filecat_next_event on a given watcher
+ * at a time (single consumer). It IS safe to call filecat_close concurrently
+ * from another thread to cancel a blocking call -- it will then return
+ * FILECAT_ERR_CLOSED. It is NOT safe to race with filecat_destroy: the
+ * consumer must have returned from its final filecat_next_event before any
+ * thread calls filecat_destroy (see filecat_destroy).
  */
 filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out);
 
@@ -99,18 +100,25 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out);
  */
 void filecat_close(filecat_watcher_t *w);
 
-/* Release the watcher. Internally calls filecat_close first if needed, then
- * drops the owner reference. The library reference-counts in-flight
- * filecat_next_event / filecat_close calls, so memory is freed only after
- * the last such call returns -- a destroy concurrent with another thread's
- * blocking next_event will not cause a use-after-free.
+/* Release the watcher's OS resources and free it.
  *
- * Idempotent across racing concurrent calls (CAS-once internally). But the
- * caller MUST NOT use the watcher pointer (or pass it to any filecat_*
- * function) after the FIRST filecat_destroy on it has returned, since the
- * memory may already be freed by then. The typical pattern is: one owner
- * thread calls destroy exactly once after all other use is done; multiple
- * threads coordinating with sync.Once (Go) or equivalent is also fine.
+ * There is NO reference counting: destroy frees immediately. The caller MUST
+ * guarantee, before calling filecat_destroy:
+ *   1. the consumer has observed FILECAT_ERR_CLOSED from filecat_next_event
+ *      and will not call filecat_next_event or filecat_close on this watcher
+ *      again. Call filecat_close first to make a blocking consumer return
+ *      FILECAT_ERR_CLOSED, then join/queiesce that consumer; and
+ *   2. exactly one thread calls filecat_destroy, exactly once.
+ *
+ * Calling any filecat_* function on the watcher after destroy has been
+ * entered -- including a second filecat_destroy -- is undefined behavior;
+ * the memory is already gone. (This is a deliberate simplification over a
+ * refcounted close: the binding above this library owns lifetime and is in a
+ * far better position to join its consumer than the C core is to second-guess
+ * it.)
+ *
+ * The typical pattern: the owner calls filecat_close, joins the consumer
+ * thread, then calls filecat_destroy exactly once.
  *
  * Safe to call with NULL.
  */
