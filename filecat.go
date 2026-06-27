@@ -14,8 +14,13 @@ import (
 	"github.com/lizzary/filecat-go/internal/cbinding"
 )
 
+// EventType classifies the kind of change reported in a FileEvent.
 type EventType int32
 
+// The event-type constants enumerate the categories of change the watcher
+// surfaces after coalescing. Rename pairs collapse into EventMove; repeat
+// modifications within the settle window collapse into a single
+// EventModified.
 const (
 	EventCreated  EventType = 1
 	EventRemoved  EventType = 2
@@ -23,6 +28,7 @@ const (
 	EventMove     EventType = 4
 )
 
+// String returns the human-readable name of the event type.
 func (t EventType) String() string {
 	switch t {
 	case EventCreated:
@@ -56,6 +62,10 @@ type FileEvent struct {
 // dropped and are not recoverable.
 var ErrOverflow = errors.New("filecat: kernel event buffer overflowed; events were dropped")
 
+// Watcher is a coalesced recursive directory watcher. Construct one with
+// NewWatcher, consume coalesced events via Events() and non-fatal errors
+// via Errors(), and release resources with Close(). All exported methods
+// are safe to call from any goroutine.
 type Watcher struct {
 	cw             *cbinding.Watcher
 	root           string

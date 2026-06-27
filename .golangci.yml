@@ -49,10 +49,12 @@ linters:
           - errcheck
           - unparam
           - revive
-      # cgo wrapper has to use C-shaped identifiers and unsafe.
-      - path: internal/cbinding/
+      # The lint job runs on Linux, where syscall.Stat_t.Dev / Ino are
+      # already uint64, so unconvert flags the casts as redundant. They
+      # are required on macOS (int32) — keep the file build-portable.
+      - path: internal/goutils/fileid/fileid_unix\.go
         linters:
-          - revive
+          - unconvert
 
 formatters:
   enable:

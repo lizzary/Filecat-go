@@ -797,9 +797,10 @@ func TestStress_ConcurrentProducers(t *testing.T) {
 						return
 					}
 				}
-				if i%3 == 0 {
+				switch i % 3 {
+				case 0:
 					_ = os.Remove(p)
-				} else if i%3 == 1 {
+				case 1:
 					_ = os.Rename(p, p+".moved")
 				}
 				opsRun.Add(1)

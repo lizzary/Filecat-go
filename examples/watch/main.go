@@ -33,7 +33,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("open: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	go func() {
 		for err := range w.Errors() {
@@ -45,7 +45,7 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-stop
-		w.Close()
+		_ = w.Close()
 	}()
 
 	log.Printf("watching %s (recursive=%v, window=%s). Ctrl+C to stop.",
